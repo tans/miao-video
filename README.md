@@ -41,6 +41,41 @@ X-Miao-Signature: {签名}  (可选)
 GET /jobs/{job_id}
 ```
 
+### 回调接口
+
+处理完成后会向 `callback_url` 发送 POST 请求：
+
+```
+Content-Type: application/json
+X-Miao-Signature: {签名}  (可选)
+
+{
+  "job_id": "任务ID",
+  "status": "done|failed",
+  "processed_url": "处理后视频URL",
+  "thumbnail_url": "缩略图URL",
+  "duration": 120.5,
+  "width": 1920,
+  "height": 1080,
+  "watermark_applied": true,
+  "compressed": true,
+  "error_message": "失败原因(可选)"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `job_id` | string | 任务ID |
+| `status` | string | `done` 成功, `failed` 失败 |
+| `processed_url` | string | 处理后视频URL |
+| `thumbnail_url` | string | 缩略图URL |
+| `duration` | float | 视频时长(秒) |
+| `width` | int | 视频宽度 |
+| `height` | int | 视频高度 |
+| `watermark_applied` | bool | 是否已加水印 |
+| `compressed` | bool | 是否已压缩 |
+| `error_message` | string | 错误信息(失败时) |
+
 ## 环境变量
 
 | 变量 | 必填 | 默认值 | 说明 |
