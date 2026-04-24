@@ -1,0 +1,10 @@
+{
+  "job_id": "manual-cos-test-20260423-10",
+  "source_url": "http://127.0.0.1:18080/video/1776368878_asset_698.mp4",
+  "biz_type": "claim_submission",
+  "biz_id": 999005,
+  "watermark_template": "default",
+  "target_format": "mp4",
+  "target_resolution": "720p",
+  "callback_url": "http://127.0.0.1:8888/internal/video-processing/callback"
+}
