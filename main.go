@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -93,6 +94,13 @@ type Server struct {
 	jobs       map[string]*Job
 }
 
+const (
+	downloadRetryAttempts = 3
+	uploadRetryAttempts   = 3
+	callbackRetryAttempts = 5
+	retryBaseDelay        = 2 * time.Second
+)
+
 func main() {
 	cfg := Config{
 		Port:           getenv("PORT", "9096"),
@@ -120,7 +128,7 @@ func main() {
 
 	s := &Server{
 		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: &http.Client{Timeout: 10 * time.Minute},
 		uploader:   uploader,
 		jobs:       map[string]*Job{},
 	}
@@ -178,9 +186,7 @@ func newCOSUploader(cfg Config) (*COSUploader, error) {
 		Region:                      cfg.COSRegion,
 		Credentials:                 credentials.NewStaticCredentialsProvider(cfg.COSSecretID, cfg.COSSecretKey, ""),
 		EndpointResolverWithOptions: resolver,
-		HTTPClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		HTTPClient:                  &http.Client{Timeout: 10 * time.Minute},
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
@@ -320,6 +326,7 @@ func (s *Server) processJob(jobID string) {
 	if !ok {
 		return
 	}
+	log.Printf("[video-processing] job=%s stage=start", jobID)
 	s.updateJob(jobID, func(j *Job) {
 		j.Status = "processing"
 	})
@@ -327,11 +334,13 @@ func (s *Server) processJob(jobID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
+	log.Printf("[video-processing] job=%s stage=download start", jobID)
 	inputPath, err := s.downloadSource(ctx, job.SourceURL, job.JobID)
 	if err != nil {
 		s.failJob(jobID, fmt.Sprintf("download source failed: %v", err))
 		return
 	}
+	log.Printf("[video-processing] job=%s stage=download done", jobID)
 	defer os.Remove(inputPath)
 
 	outputPath := filepath.Join(s.cfg.WorkDir, "tmp", job.JobID+"-output.mp4")
@@ -339,24 +348,33 @@ func (s *Server) processJob(jobID string) {
 	defer os.Remove(outputPath)
 	defer os.Remove(thumbPath)
 
-	if err := s.runFFmpeg(ctx, inputPath, outputPath, thumbPath, job.TargetResolution); err != nil {
+	log.Printf("[video-processing] job=%s stage=ffmpeg start", jobID)
+	if err := s.retryWithBackoff(ctx, jobID, "ffmpeg", 2, retryBaseDelay, func() error {
+		return s.runFFmpeg(ctx, inputPath, outputPath, thumbPath, job.TargetResolution)
+	}); err != nil {
 		s.failJob(jobID, fmt.Sprintf("ffmpeg failed: %v", err))
 		return
 	}
+	log.Printf("[video-processing] job=%s stage=ffmpeg done", jobID)
 
 	videoKey := fmt.Sprintf("claim-processed/%d/%s.mp4", job.BizID, job.JobID)
 	thumbKey := fmt.Sprintf("claim-processed/%d/%s.jpg", job.BizID, job.JobID)
 
-	processedURL, err := s.uploader.UploadFile(ctx, videoKey, outputPath, "video/mp4")
+	log.Printf("[video-processing] job=%s stage=upload_video start key=%s", jobID, videoKey)
+	processedURL, err := s.uploadFileWithRetry(ctx, jobID, "upload_video", videoKey, outputPath, "video/mp4")
 	if err != nil {
 		s.failJob(jobID, fmt.Sprintf("upload processed video failed: %v", err))
 		return
 	}
-	thumbnailURL, err := s.uploader.UploadFile(ctx, thumbKey, thumbPath, "image/jpeg")
+	log.Printf("[video-processing] job=%s stage=upload_video done", jobID)
+
+	log.Printf("[video-processing] job=%s stage=upload_thumbnail start key=%s", jobID, thumbKey)
+	thumbnailURL, err := s.uploadFileWithRetry(ctx, jobID, "upload_thumbnail", thumbKey, thumbPath, "image/jpeg")
 	if err != nil {
 		s.failJob(jobID, fmt.Sprintf("upload thumbnail failed: %v", err))
 		return
 	}
+	log.Printf("[video-processing] job=%s stage=upload_thumbnail done", jobID)
 
 	payload := CallbackPayload{
 		JobID:            job.JobID,
@@ -375,10 +393,12 @@ func (s *Server) processJob(jobID string) {
 		j.Compressed = payload.Compressed
 	})
 
-	if err := s.postCallback(payload, job.CallbackURL); err != nil {
-		s.failJob(jobID, fmt.Sprintf("callback failed: %v", err))
+	log.Printf("[video-processing] job=%s stage=callback start", jobID)
+	if err := s.postCallbackWithRetry(payload, job.CallbackURL, jobID); err != nil {
+		log.Printf("[video-processing] job=%s stage=callback warning: %v", jobID, err)
 		return
 	}
+	log.Printf("[video-processing] job=%s stage=callback done", jobID)
 }
 
 func (s *Server) failJob(jobID, errMsg string) {
@@ -386,18 +406,29 @@ func (s *Server) failJob(jobID, errMsg string) {
 	if !ok {
 		return
 	}
+	log.Printf("[video-processing] job=%s failed: %s", jobID, errMsg)
 	s.updateJob(jobID, func(j *Job) {
 		j.Status = "failed"
 		j.ErrorMessage = errMsg
 	})
-	_ = s.postCallback(CallbackPayload{
+	_ = s.postCallbackWithRetry(CallbackPayload{
 		JobID:        job.JobID,
 		Status:       "failed",
 		ErrorMessage: errMsg,
-	}, job.CallbackURL)
+	}, job.CallbackURL, jobID)
 }
 
 func (s *Server) downloadSource(ctx context.Context, sourceURL, jobID string) (string, error) {
+	var inputPath string
+	err := s.retryWithBackoff(ctx, jobID, "download", downloadRetryAttempts, retryBaseDelay, func() error {
+		var err error
+		inputPath, err = s.downloadSourceOnce(ctx, sourceURL, jobID)
+		return err
+	})
+	return inputPath, err
+}
+
+func (s *Server) downloadSourceOnce(ctx context.Context, sourceURL, jobID string) (inputPath string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {
 		return "", err
@@ -408,16 +439,21 @@ func (s *Server) downloadSource(ctx context.Context, sourceURL, jobID string) (s
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("http status %d", resp.StatusCode)
+		return "", &httpStatusError{stage: "download", code: resp.StatusCode}
 	}
 
-	inputPath := filepath.Join(s.cfg.WorkDir, "tmp", jobID+"-input"+sourceExt(sourceURL))
+	inputPath = filepath.Join(s.cfg.WorkDir, "tmp", jobID+"-input"+sourceExt(sourceURL))
 	f, err := os.Create(inputPath)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	defer func() {
+		_ = f.Close()
+		if err != nil {
+			_ = os.Remove(inputPath)
+		}
+	}()
+	if _, err = io.Copy(f, resp.Body); err != nil {
 		return "", err
 	}
 	return inputPath, nil
@@ -436,6 +472,8 @@ func (s *Server) runFFmpeg(ctx context.Context, inputPath, outputPath, thumbPath
 		"-map", "[v]",
 		"-map", "0:a?",
 		"-c:v", "libx264",
+		"-profile:v", "high",
+		"-pix_fmt", "yuv420p",
 		"-preset", "veryfast",
 		"-crf", "28",
 		"-c:a", "aac",
@@ -466,7 +504,7 @@ func buildVideoFilter(maxWidth int, watermarkText, watermarkFont string) string 
 	if font := strings.TrimSpace(watermarkFont); font != "" {
 		drawText = fmt.Sprintf("drawtext=fontfile='%s':text='%s':x=(w-tw)/2:y=(h-th)/2:fontsize=72:fontcolor=white:box=1:boxcolor=black@0.45:boxborderw=18", escapeFFmpegText(font), escapeFFmpegText(watermarkText))
 	}
-	overlay := fmt.Sprintf("[wm]format=rgba,colorchannelmixer=aa=0,%s,rotate=PI/4:c=none:ow=rotw(iw):oh=roth(ih)[rotated];[base][rotated]overlay=(W-w)/2:(H-h)/2:format=auto[v]", drawText)
+	overlay := fmt.Sprintf("[wm]format=rgba,colorchannelmixer=aa=0,%s,rotate=PI/4:c=none:ow=rotw(iw):oh=roth(ih)[rotated];[base][rotated]overlay=(W-w)/2:(H-h)/2:format=auto,format=yuv420p[v]", drawText)
 	return base + ";" + overlay
 }
 
@@ -496,28 +534,42 @@ func sourceExt(sourceURL string) string {
 	return ext
 }
 
-func (s *Server) postCallback(payload CallbackPayload, callbackURL string) error {
+func (s *Server) uploadFileWithRetry(ctx context.Context, jobID, stage, key, localPath, contentType string) (string, error) {
+	var uploadedURL string
+	err := s.retryWithBackoff(ctx, jobID, stage, uploadRetryAttempts, retryBaseDelay, func() error {
+		var err error
+		uploadedURL, err = s.uploader.UploadFile(ctx, key, localPath, contentType)
+		return err
+	})
+	return uploadedURL, err
+}
+
+func (s *Server) postCallbackWithRetry(payload CallbackPayload, callbackURL, jobID string) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, callbackURL, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if s.cfg.CallbackSecret != "" {
-		req.Header.Set("X-Miao-Signature", s.signBody(body))
-	}
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("callback status %d", resp.StatusCode)
-	}
-	return nil
+	return s.retryWithBackoff(context.Background(), jobID, "callback", callbackRetryAttempts, retryBaseDelay, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if s.cfg.CallbackSecret != "" {
+			req.Header.Set("X-Miao-Signature", s.signBody(body))
+		}
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return &httpStatusError{stage: "callback", code: resp.StatusCode}
+		}
+		return nil
+	})
 }
 
 func (s *Server) signBody(body []byte) string {
@@ -580,4 +632,98 @@ func getenv(key, fallback string) string {
 func escapeFFmpegText(value string) string {
 	replacer := strings.NewReplacer("\\", "\\\\", ":", "\\:", "'", "\\'", ",", "\\,")
 	return replacer.Replace(value)
+}
+
+func (s *Server) retryWithBackoff(ctx context.Context, jobID, stage string, maxAttempts int, baseDelay time.Duration, fn func() error) error {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if err := fn(); err != nil {
+			lastErr = err
+			if attempt == maxAttempts || !isRetryableProcessingError(err) {
+				return err
+			}
+			wait := baseDelay * time.Duration(1<<(attempt-1))
+			log.Printf("[video-processing] job=%s stage=%s retry=%d/%d wait=%s err=%v", jobID, stage, attempt, maxAttempts, wait, err)
+			if !sleepWithContext(ctx, wait) {
+				if ctx != nil && ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return lastErr
+			}
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if ctx == nil {
+		time.Sleep(d)
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+type httpStatusError struct {
+	stage string
+	code  int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s status %d", e.stage, e.code)
+}
+
+func isRetryableProcessingError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		switch statusErr.code {
+		case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusTooEarly:
+			return true
+		}
+		return statusErr.code >= 500 && statusErr.code < 600
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || netErr.Temporary() {
+			return true
+		}
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "temporarily unavailable"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "unexpected eof"),
+		strings.Contains(msg, "eof"),
+		strings.Contains(msg, "i/o timeout"),
+		strings.Contains(msg, "server error"),
+		strings.Contains(msg, "connection refused"):
+		return true
+	default:
+		return false
+	}
 }
